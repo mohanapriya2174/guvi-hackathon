@@ -1,0 +1,30 @@
+{
+  "uuid": "b92d374b-b068-44f8-a10b-38248df6c317",
+  "filename": "0_60_40_0_06514.jpg",
+  "message": "✅ Both outputs generated successfully!",
+  "results_folder": "D:\\guvi-hackathon\\guvi-hackathon-1\\backend\\results\\b92d374b-b068-44f8-a10b-38248df6c317",
+  "outputs": {
+    "forest_segmentation": "forest_segmentation.jpg",
+    "detections": "detections.jpg"
+  },
+  "accuracy": {
+    "human": 0.0,
+    "animal": 0.0,
+    "vehicle": 0.826,
+    "deforestation": 1.0
+  },
+  "found": {
+    "human": false,
+    "animal": false,
+    "cars": true,
+    "deforestation": true,
+    "living_bean": false
+  },
+  "counts": {
+    "human": 0,
+    "animal": 0,
+    "vehicle": 3,
+    "deforestation": 1,
+    "living_bean": 0
+  }
+}

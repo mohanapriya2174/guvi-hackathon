@@ -41,7 +41,7 @@ function Navbar() {
 
       if (response.ok) {
         const data = await response.json();
-        alert(`✅ Video "${data.filename}" uploaded successfully!`);
+        // alert(✅ Video "${data.filename}" uploaded successfully!);
         setShowUpload(false);
         setFile(null);
       } else {
@@ -49,7 +49,7 @@ function Navbar() {
       }
     } catch (error) {
       console.error("Upload error:", error);
-      alert("⚠️ Error connecting to server!");
+      alert("⚠ Error connecting to server!");
     } finally {
       setUploading(false);
     }

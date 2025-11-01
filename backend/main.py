@@ -325,6 +325,7 @@ import shutil
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import json
 
 app = FastAPI()
 
@@ -342,7 +343,7 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 
 
 def forest_segmentation_only(img):
-    """Return image with forest segmentation + deforestation highlight (no humans/animals/vehicles)."""
+    """Return image with forest segmentation + deforestation highlight and a deforestation score (0..1)."""
     tile_size = 512
     overlap = 64
     h, w, _ = img.shape
@@ -377,9 +378,12 @@ def forest_segmentation_only(img):
         red_overlay = (red_overlay * deforest_mask[..., None]).astype(np.uint8)
         combined_forest = cv2.addWeighted(combined_forest, 0.7, red_overlay, 0.3, 0)
 
-    return combined_forest
+    # deforestation confidence = max mask intensity (0..1)
+    deforest_conf = float(np.clip(np.max(deforest_mask), 0.0, 1.0))
+    return combined_forest, deforest_conf
+# ...existing code...
 def detection_only(img):
-    """Return image with human, animal, and vehicle detection (no forest mask)."""
+    """Return image with detections, per-class confidence stats (max conf 0..1) and per-frame counts."""
     res_vehicle_animal = animal_vehicle_model.predict(source=img, save=False, verbose=False)
     res_human = human_model.predict(source=img, save=False, verbose=False)
 
@@ -394,68 +398,85 @@ def detection_only(img):
         "Living Thing": (0, 165, 255)
     }
 
-    # Sum confidence for humans and animals
-    human_conf_sum = sum(float(h.conf[0]) for h in boxes_human)
-    animal_conf_sum = sum(float(b.conf[0]) for b in boxes_vehicle_animal if int(b.cls[0]) == 2)
+    human_max = 0.0
+    animal_max = 0.0
+    vehicle_max = 0.0
 
-    conf_threshold_general = 0.6  # High threshold to reduce false positives
-    conf_threshold_human = 0.3
+    # counters
+    human_count = 0
+    animal_count = 0
+    vehicle_count = 0
 
-    # Vehicles - always labeled Vehicle, only draw if confidence above threshold
+    # Vehicles
     for b in boxes_vehicle_animal:
         cls = int(b.cls[0])
         conf = float(b.conf[0])
-        if cls == 4 and conf >= conf_threshold_general:  # Vehicle
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            label = "Vehicle"
-            color = color_map[label]
-            cv2.rectangle(output_img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(output_img, f"{label} {conf:.2f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        if cls == 4:
+            vehicle_max = max(vehicle_max, conf)
+            if conf >= 0.6:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                label = "Vehicle"
+                color = color_map[label]
+                cv2.rectangle(output_img, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(output_img, f"{label} {conf:.2f}", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                vehicle_count += 1
 
-    # Animals - labeled Animal if animal_conf >= human_conf else Living Thing, confidence filtered
+    # Animals
     for b in boxes_vehicle_animal:
         cls = int(b.cls[0])
         conf = float(b.conf[0])
-        if cls == 2 and conf >= conf_threshold_general:
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            label = "Animal" if animal_conf_sum >= human_conf_sum else "Living Thing"
-            color = color_map[label]
-            cv2.rectangle(output_img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(output_img, f"{label} {conf:.2f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        if cls == 2:
+            animal_max = max(animal_max, conf)
+            if conf >= 0.6:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                label = "Animal"
+                color = color_map[label]
+                cv2.rectangle(output_img, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(output_img, f"{label} {conf:.2f}", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                animal_count += 1
 
-    # Humans - confidence, size, and aspect ratio filtering for strict validation
+    # Humans
     for h in boxes_human:
         conf = float(h.conf[0])
-        if conf < conf_threshold_human:
+        human_max = max(human_max, conf)
+        if conf < 0.3:
             continue
         hx1, hy1, hx2, hy2 = map(int, h.xyxy[0])
         width = hx2 - hx1
         height = hy2 - hy1
-
         if width < 30 or height < 60:
-            continue  # too small to be human
-
-        aspect_ratio = height / (width + 1e-6)
-        if aspect_ratio < 1.3:  # humans usually taller than wide, stricter
             continue
-
+        aspect_ratio = height / (width + 1e-6)
+        if aspect_ratio < 1.3:
+            continue
         label = "Human"
         color = color_map[label]
         cv2.rectangle(output_img, (hx1, hy1), (hx2, hy2), color, 2)
         cv2.putText(output_img, f"{label} {conf:.2f}", (hx1, hy1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        human_count += 1
 
-    return output_img
+    stats = {
+        "human_max": float(np.clip(human_max, 0.0, 1.0)),
+        "animal_max": float(np.clip(animal_max, 0.0, 1.0)),
+        "vehicle_max": float(np.clip(vehicle_max, 0.0, 1.0))
+    }
 
+    counts = {
+        "human": int(human_count),
+        "animal": int(animal_count),
+        "vehicle": int(vehicle_count),
+        "living_bean": int(human_count + animal_count)  # living_bean = humans + animals (per-frame)
+    }
+
+    return output_img, stats, counts
+# ...existing code...
 
 @app.post("/upload_video/")
 async def upload_file(file: UploadFile = File(...)):
-    """Handles both image and video upload and returns two outputs:
-       1. forest segmentation
-       2. human+animal+vehicle detection
-    """
+    """Handles both image and video upload and returns outputs + aggregated confidences, found-flags and counts."""
     session_id = str(uuid.uuid4())
     upload_path = os.path.join(UPLOAD_DIR, session_id)
     result_path = os.path.join(RESULT_DIR, session_id)
@@ -468,6 +489,28 @@ async def upload_file(file: UploadFile = File(...)):
 
     ext = file.filename.lower().split('.')[-1]
 
+    # accumulators for confidences (use max across frames)
+    max_human = 0.0
+    max_animal = 0.0
+    max_vehicle = 0.0
+    max_deforest = 0.0
+
+    # boolean flags (initially False)
+    human_found = False
+    animal_found = False
+    vehicle_found = False
+    deforestation_found = False
+    living_bean_found = False  # user-requested key (will be true if any living thing detected)
+
+    # total counters across frames / single image
+    total_counts = {
+        "human": 0,
+        "animal": 0,
+        "vehicle": 0,
+        "deforestation": 0,
+        "living_bean": 0
+    }
+
     if ext in ["mp4", "mov", "avi", "mkv"]:
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened():
@@ -475,7 +518,7 @@ async def upload_file(file: UploadFile = File(...)):
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_FPS) or 30.0
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 
         forest_out_path = os.path.join(result_path, "forest_segmentation.mp4")
@@ -489,8 +532,38 @@ async def upload_file(file: UploadFile = File(...)):
             if not ret:
                 break
 
-            forest_frame = forest_segmentation_only(frame)
-            detect_frame = detection_only(frame)
+            forest_frame, deforest_conf = forest_segmentation_only(frame)
+            detect_frame, stats, counts = detection_only(frame)
+
+            # update max confidences
+            max_human = max(max_human, stats.get("human_max", 0.0))
+            max_animal = max(max_animal, stats.get("animal_max", 0.0))
+            max_vehicle = max(max_vehicle, stats.get("vehicle_max", 0.0))
+            max_deforest = max(max_deforest, deforest_conf)
+
+            # accumulate counts (per-frame)
+            total_counts["human"] += counts.get("human", 0)
+            total_counts["animal"] += counts.get("animal", 0)
+            total_counts["vehicle"] += counts.get("vehicle", 0)
+            # treat deforestation as 1 per frame where deforest_conf > 0
+            if deforest_conf > 0:
+                total_counts["deforestation"] += 1
+
+            total_counts["living_bean"] += counts.get("living_bean", 0)
+
+            # set found-flags if detection confidence > 0
+            if stats.get("human_max", 0.0) > 0:
+                human_found = True
+            if stats.get("animal_max", 0.0) > 0:
+                animal_found = True
+            if stats.get("vehicle_max", 0.0) > 0:
+                vehicle_found = True
+            if deforest_conf > 0:
+                deforestation_found = True
+
+            # living_bean: true if human or animal detected
+            if human_found or animal_found:
+                living_bean_found = True
 
             forest_out.write(forest_frame)
             detect_out.write(detect_frame)
@@ -509,8 +582,33 @@ async def upload_file(file: UploadFile = File(...)):
         if img is None:
             raise HTTPException(status_code=400, detail="Uploaded image is invalid or corrupted")
 
-        forest_img = forest_segmentation_only(img)
-        detect_img = detection_only(img)
+        forest_img, deforest_conf = forest_segmentation_only(img)
+        detect_img, stats, counts = detection_only(img)
+
+        max_human = max(max_human, stats.get("human_max", 0.0))
+        max_animal = max(max_animal, stats.get("animal_max", 0.0))
+        max_vehicle = max(max_vehicle, stats.get("vehicle_max", 0.0))
+        max_deforest = max(max_deforest, deforest_conf)
+
+        # accumulate single-image counts
+        total_counts["human"] += counts.get("human", 0)
+        total_counts["animal"] += counts.get("animal", 0)
+        total_counts["vehicle"] += counts.get("vehicle", 0)
+        if deforest_conf > 0:
+            total_counts["deforestation"] += 1
+        total_counts["living_bean"] += counts.get("living_bean", 0)
+
+        # set found-flags for single image
+        if stats.get("human_max", 0.0) > 0:
+            human_found = True
+        if stats.get("animal_max", 0.0) > 0:
+            animal_found = True
+        if stats.get("vehicle_max", 0.0) > 0:
+            vehicle_found = True
+        if deforest_conf > 0:
+            deforestation_found = True
+        if human_found or animal_found:
+            living_bean_found = True
 
         forest_path = os.path.join(result_path, "forest_segmentation.jpg")
         detect_path = os.path.join(result_path, "detections.jpg")
@@ -523,498 +621,52 @@ async def upload_file(file: UploadFile = File(...)):
             "detections": detect_path
         }
 
-    return {
+    # Build aggregated accuracy object (0..1 floats rounded to 3 decimals)
+    accuracy = {
+        "human": round(float(np.clip(max_human, 0.0, 1.0)), 3),
+        "animal": round(float(np.clip(max_animal, 0.0, 1.0)), 3),
+        "vehicle": round(float(np.clip(max_vehicle, 0.0, 1.0)), 3),
+        "deforestation": round(float(np.clip(max_deforest, 0.0, 1.0)), 3)
+    }
+
+    # Return boolean found flags alongside accuracy
+    found = {
+        "human": bool(human_found),
+        "animal": bool(animal_found),
+        "cars": bool(vehicle_found),
+        "deforestation": bool(deforestation_found),
+        "living_bean": bool(living_bean_found)
+    }
+
+    # Build metadata dict to return and save (include counts)
+    metadata = {
         "uuid": session_id,
         "filename": file.filename,
         "message": "✅ Both outputs generated successfully!",
-        "results_folder": result_path,
-        "outputs": outputs
+        "results_folder": os.path.abspath(result_path),
+        "outputs": {
+            k: os.path.basename(v) if isinstance(v, str) else v
+            for k, v in outputs.items()
+        },
+        "accuracy": accuracy,
+        "found": found,
+        "counts": {
+            "human": int(total_counts["human"]),
+            "animal": int(total_counts["animal"]),
+            "vehicle": int(total_counts["vehicle"]),
+            "deforestation": int(total_counts["deforestation"]),
+            "living_bean": int(total_counts["living_bean"])
+        }
     }
-# from fastapi import FastAPI, File, UploadFile, HTTPException
-# import uuid
-# import os
-# import shutil
-# from ultralytics import YOLO
-# import cv2
-# import numpy as np
-# from collections import defaultdict
-# import math
 
-
-# app = FastAPI()
-
-
-# UPLOAD_DIR = "uploads"
-# RESULT_DIR = "results"
-# MODEL_DIR = "models"
-
-
-# # Load YOLO models
-# human_model = YOLO(os.path.join(MODEL_DIR, "human.pt"))
-# animal_vehicle_model = YOLO(os.path.join(MODEL_DIR, "vehicle_animal.pt"))
-# forest_model = YOLO(os.path.join(MODEL_DIR, "forest.pt"))
-
-
-# os.makedirs(UPLOAD_DIR, exist_ok=True)
-# os.makedirs(RESULT_DIR, exist_ok=True)
-
-
-# def calculate_iou(box1, box2):
-#     x1_min, y1_min, x1_max, y1_max = box1
-#     x2_min, y2_min, x2_max, y2_max = box2
-#     inter_xmin = max(x1_min, x2_min)
-#     inter_ymin = max(y1_min, y2_min)
-#     inter_xmax = min(x1_max, x2_max)
-#     inter_ymax = min(y1_max, y2_max)
-
-#     if inter_xmax < inter_xmin or inter_ymax < inter_ymin:
-#         return 0.0
-
-#     inter_area = (inter_xmax - inter_xmin) * (inter_ymax - inter_ymin)
-#     box1_area = (x1_max - x1_min) * (y1_max - y1_min)
-#     box2_area = (x2_max - x2_min) * (y2_max - y2_min)
-#     union_area = box1_area + box2_area - inter_area
-
-#     return inter_area / union_area if union_area > 0 else 0.0
-
-
-
-# def smart_augmentations(img):
-#     """Reduced to 6 key augmentations for speed."""
-#     h, w = img.shape[:2]
-#     augmented = []
-
-#     augmented.append(("original", img.copy(), lambda b: b))
-
-#     # Horizontal flip
-#     h_flip = cv2.flip(img, 1)
-#     augmented.append(("h_flip", h_flip, lambda boxes: [
-#         {**b, "box": (w - b["box"][2], b["box"][1], w - b["box"][0], b["box"][3])}
-#         for b in boxes
-#     ]))
-
-#     # Brightness increase
-#     bright = cv2.convertScaleAbs(img, alpha=1.3, beta=20)
-#     augmented.append(("bright", bright, lambda b: b))
-
-#     # Darker version
-#     dark = cv2.convertScaleAbs(img, alpha=0.7, beta=-20)
-#     augmented.append(("dark", dark, lambda b: b))
-
-#     # Sharpen
-#     kernel_sharp = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-#     sharpened = cv2.filter2D(img, -1, kernel_sharp)
-#     augmented.append(("sharp", sharpened, lambda b: b))
-
-#     # Vertical flip
-#     v_flip = cv2.flip(img, 0)
-#     augmented.append(("v_flip", v_flip, lambda boxes: [
-#         {**b, "box": (b["box"][0], h - b["box"][3], b["box"][2], h - b["box"][1])}
-#         for b in boxes
-#     ]))
-
-#     return augmented
-
-
-
-# def smart_multi_scale_detection(img, model, cls_filter=None):
-#     """Reduced to 5 scales and fewer augmentations for faster execution."""
-#     all_detections = []
-#     h, w = img.shape[:2]
-
-#     scales = [0.75, 0.9, 1.0, 1.15, 1.3]
-
-#     for scale in scales:
-#         new_w, new_h = int(w * scale), int(h * scale)
-
-#         if new_w < 256 or new_h < 256 or new_w > 5000 or new_h > 5000:
-#             continue
-
-#         scaled_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-
-#         augmented_images = smart_augmentations(scaled_img)
-
-#         for aug_name, aug_img, reverse_fn in augmented_images:
-#             results = model.predict(
-#                 source=aug_img,
-#                 save=False,
-#                 verbose=False,
-#                 conf=0.35,  # Increased confidence threshold
-#                 iou=0.45,   # Increased IOU threshold for better NMS
-#                 imgsz=640
-#             )
-
-#             boxes = results[0].boxes
-
-#             for b in boxes:
-#                 cls = int(b.cls[0])
-
-#                 if cls_filter and cls not in cls_filter:
-#                     continue
-
-#                 x1, y1, x2, y2 = map(float, b.xyxy[0])
-#                 conf = float(b.conf[0])
-
-#                 x1, x2 = x1 / scale, x2 / scale
-#                 y1, y2 = y1 / scale, y2 / scale
-
-#                 detection = {
-#                     "box": (int(x1), int(y1), int(x2), int(y2)),
-#                     "conf": conf,
-#                     "cls": cls,
-#                     "scale": scale,
-#                     "aug": aug_name
-#                 }
-
-#                 detection = reverse_fn([detection])[0]
-#                 all_detections.append(detection)
-
-#     return all_detections
-
-
-
-# def soft_nms(detections, iou_threshold=0.4, sigma=0.5, score_threshold=0.25):
-#     if not detections:
-#         return []
-
-#     detections = sorted(detections, key=lambda x: x["conf"], reverse=True)
-
-#     for i in range(len(detections)):
-#         if detections[i]["conf"] < score_threshold:
-#             continue
-
-#         for j in range(i + 1, len(detections)):
-#             if detections[i]["cls"] != detections[j]["cls"]:
-#                 continue
-
-#             iou = calculate_iou(detections[i]["box"], detections[j]["box"])
-
-#             if iou > iou_threshold:
-#                 detections[j]["conf"] *= math.exp(-(iou * iou) / sigma)
-
-#     return [d for d in detections if d["conf"] >= score_threshold]
-
-
-
-# def cluster_based_fusion(detections, iou_threshold=0.3, min_cluster_size=3):
-#     if not detections:
-#         return []
-
-#     class_groups = defaultdict(list)
-#     for det in detections:
-#         class_groups[det["cls"]].append(det)
-
-#     fused_results = []
-
-#     for cls, cls_dets in class_groups.items():
-#         clusters = []
-#         used = set()
-
-#         for i, det1 in enumerate(cls_dets):
-#             if i in used:
-#                 continue
-
-#             cluster = [det1]
-#             used.add(i)
-
-#             for j in range(i + 1, len(cls_dets)):
-#                 if j in used:
-#                     continue
-
-#                 for cluster_det in cluster:
-#                     iou = calculate_iou(det1["box"], cls_dets[j]["box"])
-#                     if iou > iou_threshold:
-#                         cluster.append(cls_dets[j])
-#                         used.add(j)
-#                         break
-
-#             clusters.append(cluster)
-
-#         for cluster in clusters:
-#             if len(cluster) < min_cluster_size:
-#                 if cluster:
-#                     best = max(cluster, key=lambda x: x["conf"])
-#                     if best["conf"] > 0.35:
-#                         fused_results.append(best)
-#                 continue
-
-#             total_weight = sum(d["conf"] for d in cluster)
-
-#             if total_weight == 0:
-#                 continue
-
-#             x1 = sum(d["box"][0] * d["conf"] for d in cluster) / total_weight
-#             y1 = sum(d["box"][1] * d["conf"] for d in cluster) / total_weight
-#             x2 = sum(d["box"][2] * d["conf"] for d in cluster) / total_weight
-#             y2 = sum(d["box"][3] * d["conf"] for d in cluster) / total_weight
-
-#             avg_conf = total_weight / len(cluster)
-#             max_conf = max(d["conf"] for d in cluster)
-#             voting_bonus = min(len(cluster) / 50.0, 0.2)
-
-#             final_conf = min((avg_conf + max_conf) / 2 + voting_bonus, 1.0)
-
-#             fused_results.append({
-#                 "box": (int(x1), int(y1), int(x2), int(y2)),
-#                 "conf": final_conf,
-#                 "cls": cls,
-#                 "votes": len(cluster)
-#             })
-
-#     return fused_results
-
-
-
-# def smart_forest_segmentation(img):
-#     tile_sizes = [512, 640]  # Reduced tile sizes for speed
-#     overlap = 80
-#     h, w, _ = img.shape
-
-#     forest_masks = []
-#     deforest_masks = []
-
-#     for img_scale in [0.9, 1.0, 1.15]:  # Reduced scales
-#         scaled_h, scaled_w = int(h * img_scale), int(w * img_scale)
-
-#         if scaled_h < 320 or scaled_w < 320:
-#             continue
-
-#         scaled_img = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_CUBIC)
-
-#         for tile_size in tile_sizes:
-#             forest_mask = np.zeros((scaled_h, scaled_w), dtype=np.float32)
-#             deforest_mask = np.zeros((scaled_h, scaled_w), dtype=np.float32)
-
-#             for y in range(0, scaled_h, tile_size - overlap):
-#                 for x in range(0, scaled_w, tile_size - overlap):
-#                     x_end = min(x + tile_size, scaled_w)
-#                     y_end = min(y + tile_size, scaled_h)
-#                     tile = scaled_img[y:y_end, x:x_end]
-
-#                     res_tile = forest_model.predict(
-#                         source=tile,
-#                         save=False,
-#                         verbose=False,
-#                         conf=0.20,
-#                         iou=0.4
-#                     )
-
-#                     if hasattr(res_tile[0], "masks") and res_tile[0].masks is not None:
-#                         for i, m in enumerate(res_tile[0].masks.data):
-#                             mask = m.cpu().numpy()
-#                             mask = cv2.resize(mask, (x_end - x, y_end - y))
-
-#                             cls_idx = int(res_tile[0].boxes.cls[i]) if len(res_tile[0].boxes) > i else 0
-#                             conf_val = float(res_tile[0].boxes.conf[i]) if len(res_tile[0].boxes) > i else 0.5
-
-#                             mask = mask * conf_val
-
-#                             if cls_idx == 0:
-#                                 deforest_mask[y:y_end, x:x_end] = np.maximum(
-#                                     deforest_mask[y:y_end, x:x_end], mask
-#                                 )
-#                             else:
-#                                 forest_mask[y:y_end, x:x_end] = np.maximum(
-#                                     forest_mask[y:y_end, x:x_end], mask
-#                                 )
-
-#             forest_mask = cv2.resize(forest_mask, (w, h))
-#             deforest_mask = cv2.resize(deforest_mask, (w, h))
-
-#             forest_masks.append(forest_mask)
-#             deforest_masks.append(deforest_mask)
-
-#     forest_masks = np.array(forest_masks)
-#     deforest_masks = np.array(deforest_masks)
-
-#     final_forest = np.median(forest_masks, axis=0)
-#     final_deforest = np.median(deforest_masks, axis=0)
-
-#     kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-#     kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-#     kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-
-#     final_forest = cv2.morphologyEx(final_forest, cv2.MORPH_OPEN, kernel_small)
-#     final_forest = cv2.morphologyEx(final_forest, cv2.MORPH_CLOSE, kernel_large)
-
-#     final_deforest = cv2.morphologyEx(final_deforest, cv2.MORPH_OPEN, kernel_small)
-#     final_deforest = cv2.morphologyEx(final_deforest, cv2.MORPH_CLOSE, kernel_medium)
-
-#     final_forest = cv2.GaussianBlur(final_forest, (5, 5), 1)
-#     final_deforest = cv2.GaussianBlur(final_deforest, (5, 5), 1)
-
-#     masked_img = (img * final_forest[..., None]).astype(np.uint8)
-#     background_dim = (img * (1 - final_forest[..., None]) * 0.3).astype(np.uint8)
-#     combined_forest = cv2.add(masked_img, background_dim)
-
-#     if np.any(final_deforest > 0.3):
-#         red_overlay = np.zeros_like(img, dtype=np.uint8)
-#         red_overlay[:, :, 2] = 255
-#         deforest_alpha = np.clip(final_deforest, 0, 1)[..., None]
-#         red_overlay = (red_overlay * deforest_alpha).astype(np.uint8)
-#         combined_forest = cv2.addWeighted(combined_forest, 0.65, red_overlay, 0.35, 0)
-
-#     return combined_forest
-
-
-
-# def smart_max_detection(img):
-#     output_img = img.copy()
-#     color_map = {"Human": (0, 255, 0), "Animal": (255, 0, 0), "Vehicle": (255, 255, 0)}
-
-#     animal_vehicle_detections = smart_multi_scale_detection(
-#         img, animal_vehicle_model, cls_filter=[2, 4]
-#     )
-
-#     human_detections = smart_multi_scale_detection(
-#         img, human_model, cls_filter=None
-#     )
-
-#     all_detections = []
-
-#     for det in animal_vehicle_detections:
-#         det["label"] = "Animal" if det["cls"] == 2 else "Vehicle"
-#         all_detections.append(det)
-
-#     for det in human_detections:
-#         det["label"] = "Human"
-#         all_detections.append(det)
-
-#     soft_nms_results = soft_nms(all_detections, iou_threshold=0.4, sigma=0.5, score_threshold=0.25)
-#     fused = cluster_based_fusion(soft_nms_results, iou_threshold=0.3, min_cluster_size=3)
-
-#     for det in fused:
-#         if "label" not in det:
-#             if det["cls"] == 2:
-#                 det["label"] = "Animal"
-#             elif det["cls"] == 4:
-#                 det["label"] = "Vehicle"
-#             else:
-#                 det["label"] = "Human"
-
-#     # Compare total confidence of humans vs. animals
-#     total_human_conf = sum(det["conf"] for det in fused if det["label"] == "Human")
-#     total_animal_conf = sum(det["conf"] for det in fused if det["label"] == "Animal")
-
-#     if total_human_conf > total_animal_conf:
-#         # Remove animal detections if humans dominate by confidence
-#         filtered_detections = [det for det in fused if det["label"] != "Animal"]
-#     else:
-#         filtered_detections = fused
-
-#     for det in filtered_detections:
-#         x1, y1, x2, y2 = det["box"]
-#         conf = det["conf"]
-#         label = det["label"]
-#         votes = det.get("votes", 1)
-#         color = color_map[label]
-#         thickness = int(2 + conf * 3)
-
-#         cv2.rectangle(output_img, (x1, y1), (x2, y2), color, thickness)
-
-#         text = f"{label} {conf:.2f}"
-#         if votes > 1:
-#             text += f" (v:{votes})"
-
-#         (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-#         overlay = output_img.copy()
-#         cv2.rectangle(overlay, (x1, y1 - text_h - 12), (x1 + text_w + 10, y1), color, -1)
-#         output_img = cv2.addWeighted(output_img, 0.7, overlay, 0.3, 0)
-
-#         cv2.putText(output_img, text, (x1 + 5, y1 - 6),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-#     return output_img
-
-
-
-# @app.post("/upload_video/")
-# async def upload_file(file: UploadFile = File(...)):
-#     session_id = str(uuid.uuid4())
-#     upload_path = os.path.join(UPLOAD_DIR, session_id)
-#     result_path = os.path.join(RESULT_DIR, session_id)
-#     os.makedirs(upload_path, exist_ok=True)
-#     os.makedirs(result_path, exist_ok=True)
-
-#     file_path = os.path.join(upload_path, file.filename)
-#     with open(file_path, "wb") as buffer:
-#         shutil.copyfileobj(file.file, buffer)
-
-#     ext = file.filename.lower().split('.')[-1]
-
-#     if ext in ["mp4", "mov", "avi", "mkv"]:
-#         cap = cv2.VideoCapture(file_path)
-#         if not cap.isOpened():
-#             raise HTTPException(status_code=400, detail="Could not open video file")
-
-#         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-#         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-#         fps = cap.get(cv2.CAP_FPS) or 30.0
-#         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-
-#         forest_out_path = os.path.join(result_path, "forest_segmentation.mp4")
-#         detect_out_path = os.path.join(result_path, "detections.mp4")
-
-#         forest_out = cv2.VideoWriter(forest_out_path, fourcc, fps, (width, height))
-#         detect_out = cv2.VideoWriter(detect_out_path, fourcc, fps, (width, height))
-
-#         frame_count = 0
-#         print("⚡ SMART mode optimized for production use!")
-#         print("💡 Processing every 5th frame for videos")
-
-#         while True:
-#             ret, frame = cap.read()
-#             if not ret:
-#                 break
-
-#             if frame_count % 5 == 0:
-#                 print(f"Processing frame {frame_count}...")
-#                 forest_frame = smart_forest_segmentation(frame)
-#                 detect_frame = smart_max_detection(frame)
-#             else:
-#                 forest_frame = frame
-#                 detect_frame = frame
-
-#             forest_out.write(forest_frame)
-#             detect_out.write(detect_frame)
-
-#             frame_count += 1
-
-#         cap.release()
-#         forest_out.release()
-#         detect_out.release()
-
-#         outputs = {
-#             "forest_segmentation": forest_out_path,
-#             "detections": detect_out_path
-#         }
-
-#     else:
-#         img = cv2.imread(file_path)
-#         if img is None:
-#             raise HTTPException(status_code=400, detail="Uploaded image is invalid or corrupted")
-
-#         print("🚀 Starting SMART forest segmentation...")
-#         forest_img = smart_forest_segmentation(img)
-
-#         print("🚀 Starting SMART MAX detection...")
-#         detect_img = smart_max_detection(img)
-
-#         forest_path = os.path.join(result_path, "forest_segmentation.jpg")
-#         detect_path = os.path.join(result_path, "detections.jpg")
-
-#         cv2.imwrite(forest_path, forest_img)
-#         cv2.imwrite(detect_path, detect_img)
-
-#         outputs = {
-#             "forest_segmentation": forest_path,
-#             "detections": detect_path
-#         }
-
-#     return {
-#         "uuid": session_id,
-#         "filename": file.filename,
-#         "message": "✅ SMART MAXIMUM ACCURACY processing complete! 🔥⚡",
-#         "results_folder": result_path,
-#         "outputs": outputs
-#     }
+    # Save metadata JSON as jsonfile.json inside the result folder
+    try:
+        jsonfile_path = os.path.join(result_path, "jsonfile.json")
+        with open(jsonfile_path, "w", encoding="utf-8") as jf:
+            json.dump(metadata, jf, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # log but do not fail the endpoint
+        print(f"Warning: failed to write metadata JSON to {result_path}: {e}")
+
+    return metadata
+# ...existing code...
